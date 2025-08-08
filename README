@@ -1,0 +1,11 @@
+fuse librfs
+
+rfs-fuse provides the runtime interface layer connecting rfs with libfuse or macFUSE, enabling filesystem integration on Unix-like systems.
+
+Source files in this project must begin with the following header format:
+
+  src/filename.rs
+  SPDX-License-Identifier: AGPL-3.0-or-later
+  Copyright (c) year author
+
+This header ensures consistent license attribution and copyright declaration across the codebase.
