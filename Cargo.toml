@@ -3,7 +3,16 @@ name = "rfs-fuse"
 version = "0.1.0"
 edition = "2024"
 
-[lib]
-path = "src/lib.rs"
+[[bin]]
+name = "rfs"
+path = "src/main.rs"
 
 [dependencies]
+fuser = "0.15.1"
+libc = "0.2.174"
+nix = { version = "0.30", features = ["user"] }
+rfs-ess = { path = "../ess" }
+rfs-utils = { path = "../utils" }
+thiserror = "2.0.12"
+tokio = { version = "1", features = ["full"] }
+signal-hook = "0.3.17"
