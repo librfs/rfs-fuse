@@ -16,3 +16,5 @@ rfs-utils = { path = "../utils" }
 thiserror = "2.0.12"
 tokio = { version = "1", features = ["full"] }
 signal-hook = "0.3.17"
+librfs = { path = "../../librfs" }
+rfs-pool = { path = "../pool" }

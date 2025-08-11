@@ -6,6 +6,15 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum FuseError {
-    #[error("FUSE I/O or signal error: {0}")]
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Pool configuration error: {0}")]
+    Pool(#[from] rfs_pool::PoolError),
+
+    #[error("Metadata error: {0}")]
+    Metadata(#[from] librfs::MetadataError),
+
+    #[error("Mount configuration error: {0}")]
+    MountConfig(String),
 }

@@ -9,15 +9,20 @@ use error::FuseError;
 use fs::RfsFuse;
 use fuser::{spawn_mount2, MountOption};
 use rfs_ess::load_config;
+use rfs_pool::load_and_mount_pools;
 use rfs_utils::{log, set_log_level, LogLevel};
-use signal_hook::consts::{SIGINT, SIGTERM};
-use std::ffi::{OsStr, OsString};
+use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::process;
+use std::sync::Arc;
+use tokio::task::JoinHandle;
 
 const CONFIG_PATH: &str = "/opt/rfs/rfsd/config.toml";
+const POOL_CONFIG_PATH: &str = "/opt/rfs/rfsd/pool.toml";
 
-fn main() {
-    // Load main config.
+#[tokio::main]
+async fn main() {
+    // Load main config for logging.
     let config = match load_config(CONFIG_PATH) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -25,60 +30,83 @@ fn main() {
             process::exit(1);
         }
     };
-
-    // Set log level from the config.
     set_log_level(config.common.log_level);
     log(LogLevel::Info, "Logger initialized for rfs-fuse.");
 
-    // Parse mountpoint from command-line arguments.
-    let mountpoint: OsString = match std::env::args_os().nth(1) {
-        Some(mp) => mp,
-        None => {
-            log(LogLevel::Error, "Usage: rfs <MOUNTPOINT>");
-            process::exit(1);
-        }
-    };
-
-    // Run the FUSE filesystem, handling potential errors.
-    if let Err(e) = run_fuse(&mountpoint) {
+    // Run the application and handle errors.
+    if let Err(e) = run().await {
         log(LogLevel::Error, &format!("Filesystem failed: {}", e));
         process::exit(1);
     }
-
-    // These messages are printed after run_fuse returns successfully.
-    log(LogLevel::Info, "mount has shut down. Cleaning up fuse resources.");
-    log(LogLevel::Info, &format!("Successfully umount {:?}", mountpoint));
 }
 
-// A synchronous function to set up and run the FUSE filesystem.
-fn run_fuse(mountpoint: &OsStr) -> Result<(), FuseError> {
-    log(LogLevel::Info, &format!("Mounting filesystem at {:?}", mountpoint));
-
-    let options = vec![
-        MountOption::FSName("rfs".to_string()),
-        MountOption::AutoUnmount,
-    ];
-
-    // Use spawn_mount2 to run the filesystem in the background and get a
-    // session guard. This is the key change.
-    let _session = spawn_mount2(RfsFuse, mountpoint, &options)?;
-    log(LogLevel::Info, "Filesystem mounted.");
-    let mut signals = signal_hook::iterator::Signals::new(&[SIGINT, SIGTERM])?;
-    for sig in signals.forever() {
-        println!(); // Add a newline for cleaner log output after ^C
-
-        // Map signal number to a more descriptive message.
-        match sig {
-            SIGINT => log(LogLevel::Info, "Received Ctrl+C signal."),
-            SIGTERM => log(LogLevel::Info, "Received terminate signal."),
-            _ => log(LogLevel::Info, &format!("Received signal {}.", sig)),
-        }
-        log(LogLevel::Info, "Initiating graceful shutdown.");
-        // Breaking the loop will cause the function to return.
-        break;
+async fn run() -> Result<(), FuseError> {
+    // Load pools and mount configurations.
+    let (pools, mounts) = load_and_mount_pools(POOL_CONFIG_PATH).await?;
+    if mounts.is_empty() {
+        log(LogLevel::Warn, "No FUSE mounts defined in pool.toml. Exiting.");
+        return Ok(());
     }
 
-    // The '_session' guard goes out of scope here, and its Drop
-    // implementation unmounts the filesystem.
+    // Create a quick lookup map from pool_id to pool_path.
+    let pool_map: HashMap<u64, String> =
+        pools.into_iter().map(|p| (p.pool_id, p.path)).collect();
+
+    let mut join_handles = Vec::new();
+    let mut session_guards = Vec::new();
+
+    for mount_config in mounts {
+        let pool_path = match pool_map.get(&mount_config.pool_id) {
+            Some(path) => path.clone(),
+            None => {
+                return Err(FuseError::MountConfig(format!(
+                    "Mount point '{}' references non-existent pool_id '{}'",
+                    mount_config.mount_point, mount_config.pool_id
+                )));
+            }
+        };
+
+        let mount_point = Arc::new(mount_config.mount_point);
+        let pool_root = Arc::new(pool_path);
+
+        log(LogLevel::Info, &format!("Preparing to mount pool '{}' at '{}'", pool_root, mount_point));
+
+        // Each FUSE instance needs to be spawned on a blocking-safe thread.
+        let mount_point_clone = Arc::clone(&mount_point);
+        let handle = tokio::task::spawn_blocking(move || {
+            let fuse_fs = RfsFuse::new(pool_root.to_string());
+            let options = vec![
+                MountOption::FSName("rfs".to_string()),
+                MountOption::AutoUnmount,
+                MountOption::AllowRoot, // Often needed for system-wide mounts
+            ];
+            // This returns the session guard which must be kept alive.
+            spawn_mount2(fuse_fs, mount_point_clone.as_str(), &options)
+        });
+        join_handles.push((mount_point, handle));
+    }
+
+    // Wait for the spawn_blocking tasks to finish setting up the mounts.
+    for (mount_point, handle) in join_handles {
+        match handle.await {
+            Ok(Ok(session)) => {
+                log(LogLevel::Info, &format!("Successfully mounted on {}", mount_point));
+                session_guards.push(session);
+            }
+            Ok(Err(e)) => return Err(FuseError::Io(e)),
+            Err(e) => return Err(FuseError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))),
+        }
+    }
+
+    log(LogLevel::Info, "All filesystems mounted. Press Ctrl+C to unmount all.");
+
+    // Wait for shutdown signal.
+    tokio::signal::ctrl_c().await?;
+    println!(); // Newline after ^C
+    log(LogLevel::Info, "Received Ctrl+C signal.");
+    log(LogLevel::Info, "Initiating graceful shutdown of all mounts.");
+
+    // When this function returns, all `session_guards` will be dropped,
+    // which unmounts each filesystem gracefully.
     Ok(())
 }
